@@ -1,0 +1,15 @@
+{
+  "name": "asset_scripts",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "bg_removal.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "dotenv": "^17.4.2"
+  }
+}
