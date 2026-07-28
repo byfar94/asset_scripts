@@ -1,8 +1,16 @@
 import fs from "node:fs";
 import path from "node:path";
 
+// ─── Assets root ─────────────────────────────────────────────────────────────
+// Defaults to the real Component_assets tree; override with `--folder <path>`
+// (useful for testing against a throwaway copy).
+
+const args = process.argv.slice(2);
+const folderIdx = args.indexOf("--folder");
 const ROOT_DIR =
-  "/Users/dwhitty/Documents/Hand_Theracraft/Component_assets/Exercise";
+  folderIdx !== -1 && args[folderIdx + 1]
+    ? args[folderIdx + 1]
+    : "/Users/dwhitty/Documents/Hand_Theracraft/Component_assets";
 
 // ─── Edit these to change the defaults written to each meta.json ──────────────
 
@@ -33,11 +41,38 @@ const DEFAULTS_STRETCH = {
   frequency_units: "times per day",
 };
 
+const DEFAULTS_SPLINT_STATIC = {
+  wearing_schedule: "full time",
+  duration_value: 6,
+  duration_units: "weeks",
+};
+
+const DEFAULTS_SPLINT_MOBILITY = {
+  wearing_time_value: 6,
+  wearing_time_units: "hours",
+  duration_value: 6,
+  duration_units: "weeks",
+};
+
+// Mirrors the client form's setAttributeTypeBasedOnQualityType: a splint_type maps
+// to the attribute_type whose schedule fields it uses.
+const SPLINT_ATTRIBUTE_TYPE_BY_TYPE = {
+  static: "static",
+  static_progressive: "static",
+  serial_static: "static",
+  dynamic_progressive: "mobility",
+  dynamic: "mobility",
+};
+
+// Subfolders inside a component leaf that hold assets — never treated as domain
+// hierarchy and never recursed into.
+const ASSET_SUBFOLDERS = new Set(["final", "original", "bg_removed", "audio"]);
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 const report = {
   created: [],
-  overwritten: [],
+  skipped: [],
   warnings: [],
   errors: [],
 };
@@ -60,18 +95,28 @@ function detectEquipment(folderName) {
   return null;
 }
 
-function buildTemplate(exerciseType, bodyPart, exerciseName) {
-  const label = folderNameToLabel(exerciseName);
-  const type = exerciseType.toLowerCase();
-
-  const base = {
+function buildBase(domain, name) {
+  const label = folderNameToLabel(name);
+  return {
     title_hpc: label,
     documentation_hpc: label,
-    domain_hpc: "exercise",
+    domain_hpc: domain,
     priority_hpc: 10,
-    body_part: bodyPart,
-    equipment: detectEquipment(exerciseName),
   };
+}
+
+// ─── Per-domain meta builders ────────────────────────────────────────────────
+// Each receives `levels` (folder-derived quality values, keyed by the config's
+// `levels` names — missing levels are null) and the component folder `name`.
+// Returns the meta.json object, or null to skip with a warning.
+
+function buildExerciseMeta(levels, name) {
+  const base = {
+    ...buildBase("exercise", name),
+    body_part: levels.body_part ?? null,
+    equipment: detectEquipment(name),
+  };
+  const type = (levels.exercise_type || "").toLowerCase();
 
   switch (type) {
     case "arom":
@@ -110,86 +155,182 @@ function buildTemplate(exerciseType, bodyPart, exerciseName) {
   }
 }
 
-async function processExerciseDir(exercisePath, exerciseType, bodyPart) {
-  const exerciseName = path.basename(exercisePath);
+function buildSplintMeta(levels, name) {
+  const splintType = levels.splint_type ?? null;
+  const attributeType = splintType
+    ? SPLINT_ATTRIBUTE_TYPE_BY_TYPE[splintType.toLowerCase()] ?? null
+    : null;
 
-  const finalFolder = path.join(exercisePath, "final");
-  const hasFinal =
-    fs.existsSync(finalFolder) && fs.statSync(finalFolder).isDirectory();
-  if (!hasFinal) {
-    console.warn(`Skipping (no final/ folder): ${exercisePath}`);
-    report.warnings.push({
-      folder: exercisePath,
-      reason: "No final/ folder found",
-    });
-    return;
-  }
+  const base = {
+    ...buildBase("splint", name),
+    attribute_type: attributeType,
+    splint_type: splintType,
+    primary_joint_location: levels.primary_joint_location ?? null,
+    // Written as quoted strings on purpose: the backend's parseAndValidateBool
+    // only accepts the strings "true"/"false" and throws on a JSON boolean, so
+    // these must stay quoted even after hand-editing (e.g. change to "true").
+    isfo: "false",
+    isho: "false",
+    iswo: "false",
+    iseo: "false",
+  };
 
-  const template = buildTemplate(exerciseType, bodyPart, exerciseName);
+  let attrs = {};
+  if (attributeType === "static") attrs = { ...DEFAULTS_SPLINT_STATIC };
+  else if (attributeType === "mobility") attrs = { ...DEFAULTS_SPLINT_MOBILITY };
 
-  if (template === null) {
-    console.warn(
-      `Warning: Unknown exercise type "${exerciseType}" at ${exercisePath}`,
-    );
-    report.warnings.push({
-      folder: exercisePath,
-      reason: `Unknown exercise type: "${exerciseType}"`,
-    });
-    return;
-  }
+  return { ...base, ...attrs, default_index: 0 };
+}
 
-  const metaPath = path.join(exercisePath, "meta.json");
-  const exists = fs.existsSync(metaPath);
+function buildEducationMeta(levels, name) {
+  return {
+    ...buildBase("education", name),
+    attribute_type: null,
+    education_type: levels.education_type ?? null,
+    education_path_type: levels.education_path_type ?? null,
+    default_index: 0,
+  };
+}
 
+function buildSoftTissueMeta(levels, name) {
+  return {
+    ...buildBase("soft_tissue", name),
+    attribute_type: null,
+    soft_tissue_type: levels.soft_tissue_type ?? null,
+    default_index: 0,
+  };
+}
+
+// ─── Domain configs, keyed by their top-level folder name under ROOT_DIR ──────
+// `levels` names the intermediate folders between the domain root and the
+// component leaf (positional). The component leaf is any folder containing a
+// `final/` subfolder.
+
+const DOMAIN_CONFIGS = {
+  Exercise: {
+    levels: ["body_part", "exercise_type"],
+    buildMeta: buildExerciseMeta,
+  },
+  splint: {
+    levels: ["splint_type", "primary_joint_location"],
+    buildMeta: buildSplintMeta,
+  },
+  education: {
+    levels: ["education_type", "education_path_type"],
+    buildMeta: buildEducationMeta,
+  },
+  soft_tissue: {
+    levels: ["soft_tissue_type"],
+    buildMeta: buildSoftTissueMeta,
+  },
+};
+
+// ─── Walking ─────────────────────────────────────────────────────────────────
+
+function hasFinalFolder(dir) {
   try {
-    await fs.promises.writeFile(metaPath, JSON.stringify(template, null, 2));
-    if (exists) {
-      console.log(`Overwritten: ${metaPath}`);
-      report.overwritten.push(metaPath);
-    } else {
-      console.log(`Created: ${metaPath}`);
-      report.created.push(metaPath);
-    }
-  } catch (err) {
-    console.error(`Error writing ${metaPath}:`, err.message);
-    report.errors.push({ file: metaPath, reason: err.message });
+    return fs.readdirSync(dir, { withFileTypes: true }).some(
+      (e) => e.isDirectory() && e.name.toLowerCase() === "final",
+    );
+  } catch {
+    return false;
   }
 }
 
-async function walkExercise() {
-  const bodyPartEntries = await fs.promises.readdir(ROOT_DIR, {
-    withFileTypes: true,
+// A component leaf is a directory that contains a `final/` folder. Recursion stops
+// at a leaf (its asset subfolders are never treated as hierarchy).
+function collectLeaves(dir, leaves) {
+  let entries;
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+
+  if (entries.some((e) => e.isDirectory() && e.name.toLowerCase() === "final")) {
+    leaves.push(dir);
+    return;
+  }
+
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    if (entry.name.startsWith(".")) continue;
+    if (ASSET_SUBFOLDERS.has(entry.name.toLowerCase())) continue;
+    collectLeaves(path.join(dir, entry.name), leaves);
+  }
+}
+
+function mapLevels(levelNames, segments) {
+  const out = {};
+  levelNames.forEach((levelName, i) => {
+    out[levelName] = segments[i] ?? null;
   });
+  return out;
+}
 
-  for (const bodyPartEntry of bodyPartEntries) {
-    if (!bodyPartEntry.isDirectory()) continue;
+async function processLeaf(leaf, config, domainKey) {
+  const rel = path.relative(path.join(ROOT_DIR, domainKey), leaf);
+  const parts = rel.split(path.sep).filter(Boolean);
+  const name = parts[parts.length - 1] ?? path.basename(leaf);
+  const intermediates = parts.slice(0, -1);
+  const levels = mapLevels(config.levels, intermediates);
 
-    const bodyPart = bodyPartEntry.name;
-    const bodyPartPath = path.join(ROOT_DIR, bodyPart);
-
-    const exerciseTypeEntries = await fs.promises.readdir(bodyPartPath, {
-      withFileTypes: true,
+  const meta = config.buildMeta(levels, name);
+  if (meta === null) {
+    console.warn(`Warning: could not build meta for ${leaf}`);
+    report.warnings.push({
+      folder: leaf,
+      domain: domainKey,
+      reason: "Unknown/unsupported type (folder structure did not map to a template)",
     });
+    return;
+  }
 
-    for (const exerciseTypeEntry of exerciseTypeEntries) {
-      if (!exerciseTypeEntry.isDirectory()) continue;
+  const metaPath = path.join(leaf, "meta.json");
+  if (fs.existsSync(metaPath)) {
+    console.log(`Skipping (meta.json exists): ${metaPath}`);
+    report.skipped.push({ file: metaPath, domain: domainKey });
+    return;
+  }
 
-      const exerciseType = exerciseTypeEntry.name;
-      const exerciseTypePath = path.join(bodyPartPath, exerciseType);
+  try {
+    await fs.promises.writeFile(metaPath, JSON.stringify(meta, null, 2));
+    console.log(`Created: ${metaPath}`);
+    report.created.push({ file: metaPath, domain: domainKey });
+  } catch (err) {
+    console.error(`Error writing ${metaPath}:`, err.message);
+    report.errors.push({ file: metaPath, domain: domainKey, reason: err.message });
+  }
+}
 
-      const exerciseNameEntries = await fs.promises.readdir(exerciseTypePath, {
-        withFileTypes: true,
+async function walkAllDomains() {
+  for (const [domainKey, config] of Object.entries(DOMAIN_CONFIGS)) {
+    const domainDir = path.join(ROOT_DIR, domainKey);
+    if (!fs.existsSync(domainDir) || !fs.statSync(domainDir).isDirectory()) {
+      console.warn(`Skipping domain (folder not found): ${domainDir}`);
+      report.warnings.push({
+        folder: domainDir,
+        domain: domainKey,
+        reason: "Domain folder not found",
       });
+      continue;
+    }
 
-      for (const exerciseNameEntry of exerciseNameEntries) {
-        if (!exerciseNameEntry.isDirectory()) continue;
+    const leaves = [];
+    collectLeaves(domainDir, leaves);
 
-        const exercisePath = path.join(
-          exerciseTypePath,
-          exerciseNameEntry.name,
-        );
-        await processExerciseDir(exercisePath, exerciseType, bodyPart);
-      }
+    if (leaves.length === 0) {
+      console.warn(`No component folders (with final/) under: ${domainDir}`);
+      report.warnings.push({
+        folder: domainDir,
+        domain: domainKey,
+        reason: "No component leaf folders (containing final/) found",
+      });
+      continue;
+    }
+
+    for (const leaf of leaves) {
+      await processLeaf(leaf, config, domainKey);
     }
   }
 }
@@ -198,34 +339,30 @@ function writeReport() {
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const reportPath = path.join(process.cwd(), `report-${timestamp}.md`);
 
+  const fmtEntry = (e) => `- [${e.domain}] ${e.file ?? e.folder}`;
+  const fmtIssue = (e) => `- [${e.domain}] **${e.folder ?? e.file}** — ${e.reason}`;
+
   const lines = [
     `# Meta Generator Report`,
     ``,
     `**Run:** ${new Date().toLocaleString()}`,
+    `**Root:** ${ROOT_DIR}`,
     ``,
     `## Created (${report.created.length})`,
     ``,
-    ...(report.created.length > 0
-      ? report.created.map((f) => `- ${f}`)
-      : ["_None_"]),
+    ...(report.created.length > 0 ? report.created.map(fmtEntry) : ["_None_"]),
     ``,
-    `## Overwritten (${report.overwritten.length})`,
+    `## Skipped — already exists (${report.skipped.length})`,
     ``,
-    ...(report.overwritten.length > 0
-      ? report.overwritten.map((f) => `- ${f}`)
-      : ["_None_"]),
+    ...(report.skipped.length > 0 ? report.skipped.map(fmtEntry) : ["_None_"]),
     ``,
     `## Warnings (${report.warnings.length})`,
     ``,
-    ...(report.warnings.length > 0
-      ? report.warnings.map((w) => `- **${w.folder}** — ${w.reason}`)
-      : ["_None_"]),
+    ...(report.warnings.length > 0 ? report.warnings.map(fmtIssue) : ["_None_"]),
     ``,
     `## Errors (${report.errors.length})`,
     ``,
-    ...(report.errors.length > 0
-      ? report.errors.map((e) => `- **${e.file}** — ${e.reason}`)
-      : ["_None_"]),
+    ...(report.errors.length > 0 ? report.errors.map(fmtIssue) : ["_None_"]),
     ``,
   ];
 
@@ -233,14 +370,14 @@ function writeReport() {
   console.log(`Report saved: ${reportPath}`);
 }
 
-walkExercise()
+walkAllDomains()
   .then(() => {
     console.log("");
     console.log(`Summary:`);
-    console.log(`  Created:     ${report.created.length}`);
-    console.log(`  Overwritten: ${report.overwritten.length}`);
-    console.log(`  Warnings:    ${report.warnings.length}`);
-    console.log(`  Errors:      ${report.errors.length}`);
+    console.log(`  Created:  ${report.created.length}`);
+    console.log(`  Skipped:  ${report.skipped.length}`);
+    console.log(`  Warnings: ${report.warnings.length}`);
+    console.log(`  Errors:   ${report.errors.length}`);
     writeReport();
   })
   .catch((err) => {
