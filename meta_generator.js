@@ -12,6 +12,17 @@ const ROOT_DIR =
     ? args[folderIdx + 1]
     : "/Users/dwhitty/Documents/Hand_Theracraft/Component_assets";
 
+// `--retitle` refreshes title_hpc/documentation_hpc on meta.json files that already
+// exist, re-deriving them from the (possibly renamed) component folder name. Every
+// other field is preserved verbatim — this is the only mode that touches an existing
+// file, and it touches nothing else. Without it, existing files are left alone.
+const RETITLE = args.includes("--retitle");
+
+// `--dry-run` reports exactly what would change without writing anything. Worth using
+// before a --retitle run: hand-tuned titles that intentionally diverge from their
+// folder name (e.g. "fpl repair week 4") get flattened back to the folder name.
+const DRY_RUN = args.includes("--dry-run");
+
 // ─── Edit these to change the defaults written to each meta.json ──────────────
 
 const DEFAULTS_AROM = {
@@ -73,6 +84,8 @@ const ASSET_SUBFOLDERS = new Set(["final", "original", "bg_removed", "audio"]);
 const report = {
   created: [],
   skipped: [],
+  retitled: [],
+  unchanged: [],
   warnings: [],
   errors: [],
 };
@@ -288,8 +301,18 @@ async function processLeaf(leaf, config, domainKey) {
 
   const metaPath = path.join(leaf, "meta.json");
   if (fs.existsSync(metaPath)) {
-    console.log(`Skipping (meta.json exists): ${metaPath}`);
-    report.skipped.push({ file: metaPath, domain: domainKey });
+    if (RETITLE) {
+      await retitleExisting(metaPath, name, domainKey);
+    } else {
+      console.log(`Skipping (meta.json exists): ${metaPath}`);
+      report.skipped.push({ file: metaPath, domain: domainKey });
+    }
+    return;
+  }
+
+  if (DRY_RUN) {
+    console.log(`Would create: ${metaPath}`);
+    report.created.push({ file: metaPath, domain: domainKey });
     return;
   }
 
@@ -297,6 +320,58 @@ async function processLeaf(leaf, config, domainKey) {
     await fs.promises.writeFile(metaPath, JSON.stringify(meta, null, 2));
     console.log(`Created: ${metaPath}`);
     report.created.push({ file: metaPath, domain: domainKey });
+  } catch (err) {
+    console.error(`Error writing ${metaPath}:`, err.message);
+    report.errors.push({ file: metaPath, domain: domainKey, reason: err.message });
+  }
+}
+
+// Rewrites only title_hpc/documentation_hpc from the folder name. The file is read,
+// those two keys are replaced in place, and everything else — hand-tuned reps, holds,
+// booleans, unknown keys added later — is written back untouched. Key order is
+// preserved because both keys already exist in every generated file.
+async function retitleExisting(metaPath, name, domainKey) {
+  let existing;
+  try {
+    existing = JSON.parse(await fs.promises.readFile(metaPath, "utf8"));
+  } catch (err) {
+    console.error(`Error reading ${metaPath}:`, err.message);
+    report.errors.push({
+      file: metaPath,
+      domain: domainKey,
+      reason: `Could not read/parse existing meta.json — ${err.message}`,
+    });
+    return;
+  }
+
+  const label = folderNameToLabel(name);
+  const changes = [];
+  if (existing.title_hpc !== label) {
+    changes.push(`title_hpc: "${existing.title_hpc}" → "${label}"`);
+  }
+  if (existing.documentation_hpc !== label) {
+    changes.push(`documentation_hpc: "${existing.documentation_hpc}" → "${label}"`);
+  }
+
+  if (changes.length === 0) {
+    report.unchanged.push({ file: metaPath, domain: domainKey });
+    return;
+  }
+
+  const entry = { file: metaPath, domain: domainKey, changes };
+
+  if (DRY_RUN) {
+    console.log(`Would retitle: ${metaPath}\n    ${changes.join("\n    ")}`);
+    report.retitled.push(entry);
+    return;
+  }
+
+  const updated = { ...existing, title_hpc: label, documentation_hpc: label };
+
+  try {
+    await fs.promises.writeFile(metaPath, JSON.stringify(updated, null, 2));
+    console.log(`Retitled: ${metaPath}\n    ${changes.join("\n    ")}`);
+    report.retitled.push(entry);
   } catch (err) {
     console.error(`Error writing ${metaPath}:`, err.message);
     report.errors.push({ file: metaPath, domain: domainKey, reason: err.message });
@@ -341,20 +416,36 @@ function writeReport() {
 
   const fmtEntry = (e) => `- [${e.domain}] ${e.file ?? e.folder}`;
   const fmtIssue = (e) => `- [${e.domain}] **${e.folder ?? e.file}** — ${e.reason}`;
+  const fmtRetitle = (e) =>
+    [`- [${e.domain}] ${e.file}`, ...e.changes.map((c) => `  - ${c}`)].join("\n");
+
+  const mode = [
+    RETITLE ? "retitle" : "create-if-missing",
+    DRY_RUN ? "dry run (nothing written)" : "live",
+  ].join(", ");
 
   const lines = [
     `# Meta Generator Report`,
     ``,
     `**Run:** ${new Date().toLocaleString()}`,
     `**Root:** ${ROOT_DIR}`,
+    `**Mode:** ${mode}`,
     ``,
-    `## Created (${report.created.length})`,
+    `## ${DRY_RUN ? "Would create" : "Created"} (${report.created.length})`,
     ``,
     ...(report.created.length > 0 ? report.created.map(fmtEntry) : ["_None_"]),
     ``,
     `## Skipped — already exists (${report.skipped.length})`,
     ``,
     ...(report.skipped.length > 0 ? report.skipped.map(fmtEntry) : ["_None_"]),
+    ``,
+    `## ${DRY_RUN ? "Would retitle" : "Retitled"} (${report.retitled.length})`,
+    ``,
+    ...(report.retitled.length > 0 ? report.retitled.map(fmtRetitle) : ["_None_"]),
+    ``,
+    `## Already matched folder name (${report.unchanged.length})`,
+    ``,
+    ...(report.unchanged.length > 0 ? report.unchanged.map(fmtEntry) : ["_None_"]),
     ``,
     `## Warnings (${report.warnings.length})`,
     ``,
@@ -373,11 +464,13 @@ function writeReport() {
 walkAllDomains()
   .then(() => {
     console.log("");
-    console.log(`Summary:`);
-    console.log(`  Created:  ${report.created.length}`);
-    console.log(`  Skipped:  ${report.skipped.length}`);
-    console.log(`  Warnings: ${report.warnings.length}`);
-    console.log(`  Errors:   ${report.errors.length}`);
+    console.log(`Summary:${DRY_RUN ? "  (dry run — nothing written)" : ""}`);
+    console.log(`  Created:   ${report.created.length}`);
+    console.log(`  Skipped:   ${report.skipped.length}`);
+    console.log(`  Retitled:  ${report.retitled.length}`);
+    console.log(`  Unchanged: ${report.unchanged.length}`);
+    console.log(`  Warnings:  ${report.warnings.length}`);
+    console.log(`  Errors:    ${report.errors.length}`);
     writeReport();
   })
   .catch((err) => {
