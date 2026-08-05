@@ -79,6 +79,13 @@ const SPLINT_ATTRIBUTE_TYPE_BY_TYPE = {
 // hierarchy and never recursed into.
 const ASSET_SUBFOLDERS = new Set(["final", "original", "bg_removed", "audio"]);
 
+// Kept identical to VIDEO_EXTS/CAPTION_EXTS in the backend seeder
+// (server/src/scripts/runSeed.ts). The seeder skips any component whose final/
+// holds a video with no matching caption, so if these two lists drift this
+// script stops predicting what the seed will actually do.
+const VIDEO_EXTS = new Set([".mp4", ".mov"]);
+const CAPTION_EXTS = new Set([".srt", ".vtt"]);
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 const report = {
@@ -86,6 +93,10 @@ const report = {
   skipped: [],
   retitled: [],
   unchanged: [],
+  // Kept out of `warnings` on purpose: this is the list you act on before a
+  // seed run, and burying it among unknown-type/domain-not-found warnings makes
+  // it hard to scan.
+  missingCaptions: [],
   warnings: [],
   errors: [],
 };
@@ -240,13 +251,30 @@ const DOMAIN_CONFIGS = {
 
 // ─── Walking ─────────────────────────────────────────────────────────────────
 
-function hasFinalFolder(dir) {
+// Case-insensitive subfolder lookup, mirroring findSubdir in the backend seeder
+// so both agree on which folder counts as `final/` or `audio/`.
+function findSubdir(dir, name) {
+  let entries;
   try {
-    return fs.readdirSync(dir, { withFileTypes: true }).some(
-      (e) => e.isDirectory() && e.name.toLowerCase() === "final",
-    );
+    entries = fs.readdirSync(dir, { withFileTypes: true });
   } catch {
-    return false;
+    return null;
+  }
+  const found = entries.find(
+    (e) => e.isDirectory() && e.name.toLowerCase() === name.toLowerCase(),
+  );
+  return found ? path.join(dir, found.name) : null;
+}
+
+// Mirrors listUsableFiles in the backend seeder: skips dotfiles (.DS_Store) and
+// the `__`-prefixed scratch files that turn up in these folders.
+function listUsableFiles(dir) {
+  try {
+    return fs
+      .readdirSync(dir)
+      .filter((n) => !n.startsWith(".") && !n.startsWith("__"));
+  } catch {
+    return [];
   }
 }
 
@@ -281,7 +309,46 @@ function mapLevels(levelNames, segments) {
   return out;
 }
 
+// Admin components are expected to ship captions with every video, and the
+// backend seeder now refuses to create one that doesn't. This reports the same
+// condition ahead of the seed, so the gap is visible while the assets are still
+// being assembled rather than as a skipped folder mid-run.
+//
+// Only `final/` counts — `original/` and `bg_removed/` hold working copies that
+// are never uploaded. Captions are matched by extension, not by name, because
+// the naming in audio/ is inconsistent (`_cap.srt`, `_caption.srt`, `_video.srt`
+// and bare names all appear).
+function checkCaptions(leaf, domainKey) {
+  const finalDir = findSubdir(leaf, "final");
+  if (!finalDir) return;
+
+  const hasVideo = listUsableFiles(finalDir).some((f) =>
+    VIDEO_EXTS.has(path.extname(f).toLowerCase()),
+  );
+  if (!hasVideo) return;
+
+  const audioDir = findSubdir(leaf, "audio");
+  const hasCaption =
+    audioDir !== null &&
+    listUsableFiles(audioDir).some((f) =>
+      CAPTION_EXTS.has(path.extname(f).toLowerCase()),
+    );
+  if (hasCaption) return;
+
+  const reason = audioDir
+    ? "video in final/ but no caption file (.srt/.vtt) in audio/"
+    : "video in final/ but no audio/ folder";
+
+  console.warn(`Warning: ${reason} — ${leaf}`);
+  report.missingCaptions.push({ folder: leaf, domain: domainKey, reason });
+}
+
 async function processLeaf(leaf, config, domainKey) {
+  // First, before any early return below. A missing caption is worth reporting
+  // whether or not the folder maps to a known type and whether or not its
+  // meta.json already exists — both of those paths return early.
+  checkCaptions(leaf, domainKey);
+
   const rel = path.relative(path.join(ROOT_DIR, domainKey), leaf);
   const parts = rel.split(path.sep).filter(Boolean);
   const name = parts[parts.length - 1] ?? path.basename(leaf);
@@ -447,6 +514,15 @@ function writeReport() {
     ``,
     ...(report.unchanged.length > 0 ? report.unchanged.map(fmtEntry) : ["_None_"]),
     ``,
+    `## Videos missing captions (${report.missingCaptions.length})`,
+    ``,
+    `_The seeder skips these — they will not be created until a caption file_`,
+    `_(.srt or .vtt) exists in the component's audio/ folder._`,
+    ``,
+    ...(report.missingCaptions.length > 0
+      ? report.missingCaptions.map(fmtIssue)
+      : ["_None_"]),
+    ``,
     `## Warnings (${report.warnings.length})`,
     ``,
     ...(report.warnings.length > 0 ? report.warnings.map(fmtIssue) : ["_None_"]),
@@ -469,6 +545,7 @@ walkAllDomains()
     console.log(`  Skipped:   ${report.skipped.length}`);
     console.log(`  Retitled:  ${report.retitled.length}`);
     console.log(`  Unchanged: ${report.unchanged.length}`);
+    console.log(`  Missing captions: ${report.missingCaptions.length}`);
     console.log(`  Warnings:  ${report.warnings.length}`);
     console.log(`  Errors:    ${report.errors.length}`);
     writeReport();
