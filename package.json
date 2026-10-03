@@ -4,7 +4,9 @@
   "type": "module",
   "main": "bg_removal.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "remap:dry": "node meta_remap.js --dry-run",
+    "remap": "node meta_remap.js"
   },
   "author": "",
   "license": "ISC",

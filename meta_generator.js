@@ -52,39 +52,72 @@ const DEFAULTS_STRETCH = {
   frequency_units: "times per day",
 };
 
-const DEFAULTS_SPLINT_STATIC = {
-  wearing_schedule: "full time",
-  duration_value: 6,
-  duration_units: "weeks",
+// Splint dosage column names come from the app's attribute registry
+// (shared/src/taxonomy/components/attributeFields.ts, domain "splint"):
+// wearing_schedule, wearing_time_value/_units, wear_for_value/_units.
+// wearing_schedule must be one of the four `wearingSchedules` values in
+// shared/src/taxonomy/components/attributeUnits.ts. "full time" was not one of
+// them, so a static splint generated from it could never be linked into a
+// template — the create schema checks the field with z.enum.
+//
+// "wear_for" is how long to keep wearing the splint (days / weeks / months).
+// It was called "duration" until 2026-10-03; the seeder now ignores keys the
+// domain does not have, so an old "duration_*" pair would be dropped silently.
+const DEFAULTS_RESISTANCE_ISOMETRIC = {
+  hold_value: 45,
+  hold_units: "seconds",
+  sets_value: 5,
+  sets_units: "sets",
+  frequency_value: 1,
+  frequency_units: "times per day",
 };
 
+const DEFAULTS_SPLINT_STATIC = {
+  wearing_schedule: "full time except showering",
+  wear_for_value: 6,
+  wear_for_units: "weeks",
+};
+
+// wearing_time_units must be exactly WEARING_TIME_UNITS ("hours per day").
 const DEFAULTS_SPLINT_MOBILITY = {
   wearing_time_value: 6,
-  wearing_time_units: "hours",
-  duration_value: 6,
-  duration_units: "weeks",
+  wearing_time_units: "hours per day",
+  wear_for_value: 6,
+  wear_for_units: "weeks",
 };
 
-// Mirrors the client form's setAttributeTypeBasedOnQualityType: a splint_type maps
-// to the attribute_type whose schedule fields it uses.
+// Which default dosage shape a splint_type starts with. Mirrors the app's
+// suggestions in attributeFields.ts: static and the generic dynamic splint are
+// worn on a schedule; the progressive and serial types are worn for hours per
+// day. Every value here is a real `splintTypes` entry.
+//
+// The resulting `attribute_type` key is written for continuity with older
+// files only: the seeder no longer reads it (dosage is per-field now), so it is
+// not load bearing. The shape it names still decides which defaults are emitted.
 const SPLINT_ATTRIBUTE_TYPE_BY_TYPE = {
   static: "static",
-  static_progressive: "static",
-  serial_static: "static",
+  dynamic: "static",
+  static_progressive: "mobility",
+  serial_static: "mobility",
   dynamic_progressive: "mobility",
-  dynamic: "mobility",
 };
 
 // Subfolders inside a component leaf that hold assets — never treated as domain
 // hierarchy and never recursed into.
 const ASSET_SUBFOLDERS = new Set(["final", "original", "bg_removed", "audio"]);
 
-// Kept identical to VIDEO_EXTS/CAPTION_EXTS in the backend seeder
+// Kept identical to IMAGE_EXTS/VIDEO_EXTS/CAPTION_EXTS in the backend seeder
 // (server/src/scripts/runSeed.ts). The seeder skips any component whose final/
-// holds a video with no matching caption, so if these two lists drift this
-// script stops predicting what the seed will actually do.
+// holds a video with no matching caption, so if these lists drift this script
+// stops predicting what the seed will actually do.
+const IMAGE_EXTS = new Set([".jpg", ".jpeg", ".png", ".webp", ".avif"]);
 const VIDEO_EXTS = new Set([".mp4", ".mov"]);
 const CAPTION_EXTS = new Set([".srt", ".vtt"]);
+
+// The marker that names a component's default image. The seeder picks the first
+// image in sort order whose filename contains this — there is no meta.json key
+// for it.
+const DEFAULT_IMAGE_MARKER = "(d)";
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -97,6 +130,10 @@ const report = {
   // seed run, and burying it among unknown-type/domain-not-found warnings makes
   // it hard to scan.
   missingCaptions: [],
+  // Same reasoning as missingCaptions: a to-do list you act on while arranging
+  // assets, not a general warning. Unlike captions this one never blocks a
+  // seed — it flags a choice the seeder would make silently.
+  ambiguousDefaults: [],
   warnings: [],
   errors: [],
 };
@@ -105,13 +142,24 @@ function folderNameToLabel(name) {
   return name.toLowerCase().replace(/_/g, " ");
 }
 
+// Every return value here must be one of the `exerciseEquipment` values in
+// shared/src/taxonomy/components/exerciseDomain.ts. This used to return the
+// short forms "band" and "putty", which are not taxonomy values — the nav then
+// rendered them through the title-case fallback as "Band"/"Putty" instead of
+// "Theraband"/"Theraputty".
+//
+// Order matters: "theraband" and "rubberband" both contain "band", so the
+// specific spellings have to be tested before the generic branch. Folder names
+// use both "rubber_band" and "rubberband", and only the underscored form used
+// to be recognised — the rest fell through to the generic band branch.
 function detectEquipment(folderName) {
   const name = folderName.toLowerCase();
-  if (name.includes("rubber_band")) return "rubber_band";
-  if (name.includes("theraband")) return "band";
-  if (name.includes("theraputty")) return "putty";
-  if (name.includes("band") && !name.includes("rubber_band")) return "band";
-  if (name.includes("putty")) return "putty";
+  if (name.includes("rubber_band") || name.includes("rubberband"))
+    return "rubber_band";
+  if (name.includes("theraband")) return "theraband";
+  if (name.includes("theraputty")) return "theraputty";
+  if (name.includes("band")) return "theraband";
+  if (name.includes("putty")) return "theraputty";
   if (name.includes("towel")) return "towel";
   if (name.includes("dumbbell")) return "dumbbell";
   if (name.includes("gym")) return "gym_equipment";
@@ -149,30 +197,41 @@ function buildExerciseMeta(levels, name) {
         attribute_type: "arom",
         exercise_type: "arom",
         ...DEFAULTS_AROM,
-        default_index: 0,
       };
-    case "resistance":
+    case "resistance": {
+      // contraction_type is required for resistance by the app's create
+      // schema and picks the dosage. Inferred from the folder name: anything
+      // mentioning "isometric" is isometric (45 s hold, 5 sets, once a day),
+      // the rest isotonic (reps, sets, frequency). Hand-edit when the name
+      // does not say. Four fields is the app's maximum per component.
+      const isometric = /isometric/i.test(name);
       return {
         ...base,
         attribute_type: "resistance",
         exercise_type: "resistance",
-        ...DEFAULTS_RESISTANCE,
-        default_index: 0,
+        contraction_type: isometric ? "isometric" : "isotonic",
+        ...(isometric ? DEFAULTS_RESISTANCE_ISOMETRIC : DEFAULTS_RESISTANCE),
       };
-    case "stretch":
+    }
+    // Not a typo. The exercise type was renamed "stretch" → "prom", but the
+    // attribute set it is dosed on was not: the schedule fields still live in
+    // hpc_schedule_attributes_stretch and insertHpcExercise switches on
+    // attribute_type === "stretch" literally. Same asymmetry as
+    // setAttributeTypeBasedOnQualityType in the client form, which this switch
+    // mirrors. Setting attribute_type to "prom" here makes the seeder throw
+    // `Unsupported attribute type: prom` on every PROM component.
+    case "prom":
       return {
         ...base,
         attribute_type: "stretch",
-        exercise_type: "stretch",
+        exercise_type: "prom",
         ...DEFAULTS_STRETCH,
-        default_index: 0,
       };
     case "misc":
       return {
         ...base,
         attribute_type: "misc",
         exercise_type: "misc",
-        default_index: 0,
       };
     default:
       return null;
@@ -203,7 +262,7 @@ function buildSplintMeta(levels, name) {
   if (attributeType === "static") attrs = { ...DEFAULTS_SPLINT_STATIC };
   else if (attributeType === "mobility") attrs = { ...DEFAULTS_SPLINT_MOBILITY };
 
-  return { ...base, ...attrs, default_index: 0 };
+  return { ...base, ...attrs };
 }
 
 function buildEducationMeta(levels, name) {
@@ -212,7 +271,6 @@ function buildEducationMeta(levels, name) {
     attribute_type: null,
     education_type: levels.education_type ?? null,
     education_path_type: levels.education_path_type ?? null,
-    default_index: 0,
   };
 }
 
@@ -221,7 +279,6 @@ function buildSoftTissueMeta(levels, name) {
     ...buildBase("soft_tissue", name),
     attribute_type: null,
     soft_tissue_type: levels.soft_tissue_type ?? null,
-    default_index: 0,
   };
 }
 
@@ -343,11 +400,40 @@ function checkCaptions(leaf, domainKey) {
   report.missingCaptions.push({ folder: leaf, domain: domainKey, reason });
 }
 
+// The default image is chosen by filename: the seeder takes the first image in
+// sort order whose name contains "(d)". More than one marked image is therefore
+// not an error — it just means the seeder picks silently, and which one wins
+// depends on sort order rather than on anything the folder says. Reported so
+// that choice surfaces while the assets are being arranged.
+//
+// Only `final/` counts, and only images: a "(d)" in a video filename is not a
+// default-image marker. No warning when nothing is marked — that is the normal
+// case and index 0 wins.
+function checkDefaultImage(leaf, domainKey) {
+  const finalDir = findSubdir(leaf, "final");
+  if (!finalDir) return;
+
+  const marked = listUsableFiles(finalDir)
+    .filter((f) => IMAGE_EXTS.has(path.extname(f).toLowerCase()))
+    .sort()
+    .filter((f) => f.toLowerCase().includes(DEFAULT_IMAGE_MARKER));
+
+  if (marked.length < 2) return;
+
+  const reason =
+    `${marked.length} images marked "${DEFAULT_IMAGE_MARKER}" — the seeder will use ` +
+    `"${marked[0]}" and ignore ${marked.slice(1).map((f) => `"${f}"`).join(", ")}`;
+
+  console.warn(`Warning: ${reason} — ${leaf}`);
+  report.ambiguousDefaults.push({ folder: leaf, domain: domainKey, reason });
+}
+
 async function processLeaf(leaf, config, domainKey) {
   // First, before any early return below. A missing caption is worth reporting
   // whether or not the folder maps to a known type and whether or not its
   // meta.json already exists — both of those paths return early.
   checkCaptions(leaf, domainKey);
+  checkDefaultImage(leaf, domainKey);
 
   const rel = path.relative(path.join(ROOT_DIR, domainKey), leaf);
   const parts = rel.split(path.sep).filter(Boolean);
@@ -523,6 +609,16 @@ function writeReport() {
       ? report.missingCaptions.map(fmtIssue)
       : ["_None_"]),
     ``,
+    `## Ambiguous default image (${report.ambiguousDefaults.length})`,
+    ``,
+    `_More than one image in final/ is marked "${DEFAULT_IMAGE_MARKER}". These still_`,
+    `_seed — the first in sort order wins — but the choice is not yours until only_`,
+    `_one image carries the marker._`,
+    ``,
+    ...(report.ambiguousDefaults.length > 0
+      ? report.ambiguousDefaults.map(fmtIssue)
+      : ["_None_"]),
+    ``,
     `## Warnings (${report.warnings.length})`,
     ``,
     ...(report.warnings.length > 0 ? report.warnings.map(fmtIssue) : ["_None_"]),
@@ -546,6 +642,7 @@ walkAllDomains()
     console.log(`  Retitled:  ${report.retitled.length}`);
     console.log(`  Unchanged: ${report.unchanged.length}`);
     console.log(`  Missing captions: ${report.missingCaptions.length}`);
+    console.log(`  Ambiguous default image: ${report.ambiguousDefaults.length}`);
     console.log(`  Warnings:  ${report.warnings.length}`);
     console.log(`  Errors:    ${report.errors.length}`);
     writeReport();
