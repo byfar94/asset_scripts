@@ -38,6 +38,9 @@ async function walkDirectory(dir) {
   for (const entry of entries) {
     const fullPath = path.join(dir, entry.name);
 
+    // `<name>.skip` / `<name>.skip.<ext>` entries are ignored (lib/tree.js rule).
+    if (/\.skip(\.[^.]*)?$/i.test(entry.name)) continue;
+
     if (entry.isDirectory()) {
       await walkDirectory(fullPath);
     } else if (entry.isFile() && entry.name.toLowerCase().endsWith(".rtf")) {

@@ -32,9 +32,13 @@ function folderExists(folderPath) {
   }
 }
 
+// Anything named `<name>.skip` or `<name>.skip.<ext>` is ignored (same rule as
+// lib/tree.js isSkipped). A `.skip.jpg` in original/ is never sent to remove.bg.
+const SKIP_RE = /\.skip(\.[^.]*)?$/i;
+
 function isFolderEmpty(folderPath) {
   if (!folderExists(folderPath)) return true;
-  const entries = fs.readdirSync(folderPath).filter((f) => !f.startsWith("."));
+  const entries = fs.readdirSync(folderPath).filter((f) => !f.startsWith(".") && !SKIP_RE.test(f));
   return entries.length === 0;
 }
 
@@ -85,6 +89,7 @@ async function walkDirectory(currentDir) {
     const fullPath = path.join(currentDir, entry.name);
 
     if (!entry.isDirectory()) continue;
+    if (SKIP_RE.test(entry.name)) continue;
 
     if (entry.name === "original") {
       const parentFolder = path.dirname(fullPath);
@@ -95,7 +100,7 @@ async function walkDirectory(currentDir) {
       });
 
       const jpgFiles = originalEntries
-        .filter((file) => file.isFile() && isJpg(file.name))
+        .filter((file) => file.isFile() && isJpg(file.name) && !SKIP_RE.test(file.name))
         .map((file) => path.join(fullPath, file.name));
 
       if (jpgFiles.length === 0) {

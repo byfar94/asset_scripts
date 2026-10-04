@@ -68,7 +68,7 @@ function collectLeaves(dir, leaves) {
 
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
-    if (entry.name.startsWith(".")) continue;
+    if (entry.name.startsWith(".") || /\.skip(\.[^.]*)?$/i.test(entry.name)) continue;
     if (ASSET_SUBFOLDERS.has(entry.name.toLowerCase())) continue;
     collectLeaves(path.join(dir, entry.name), leaves);
   }

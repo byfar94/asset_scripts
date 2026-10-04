@@ -5,6 +5,12 @@
   "main": "bg_removal.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
+    "status": "node component_status.js",
+    "status:dry": "node component_status.js --dry-run",
+    "todo": "node component_status.js --todo --dry-run",
+    "dashboard": "node dashboard.js",
+    "add": "node add_components.js",
+    "add:dry": "node add_components.js --dry-run",
     "remap:dry": "node meta_remap.js --dry-run",
     "remap": "node meta_remap.js"
   },
